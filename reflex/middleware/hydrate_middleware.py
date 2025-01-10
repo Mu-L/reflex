@@ -1,26 +1,25 @@
 """Middleware to hydrate the state."""
+
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING, Optional
 
 from reflex import constants
-from reflex.event import Event, fix_events, get_hydrate_event
+from reflex.event import Event, get_hydrate_event
 from reflex.middleware.middleware import Middleware
-from reflex.state import State, StateUpdate
-from reflex.utils import format
+from reflex.state import BaseState, StateUpdate
 
 if TYPE_CHECKING:
     from reflex.app import App
 
 
-State.add_var(constants.IS_HYDRATED, type_=bool, default_value=False)
-
-
+@dataclasses.dataclass(init=True)
 class HydrateMiddleware(Middleware):
     """Middleware to handle initial app hydration."""
 
     async def preprocess(
-        self, app: App, state: State, event: Event
+        self, app: App, state: BaseState, event: Event
     ) -> Optional[StateUpdate]:
         """Preprocess the event.
 
@@ -36,18 +35,16 @@ class HydrateMiddleware(Middleware):
         if event.name != get_hydrate_event(state):
             return None
 
+        # Clear client storage, to respect clearing cookies
+        state._reset_client_storage()
+
+        # Mark state as not hydrated (until on_loads are complete)
+        setattr(state, constants.CompileVars.IS_HYDRATED, False)
+
         # Get the initial state.
-        setattr(state, constants.IS_HYDRATED, False)
-        delta = format.format_state({state.get_name(): state.dict()})
+        delta = state.dict()
         # since a full dict was captured, clean any dirtiness
-        state.clean()
-
-        # Get the route for on_load events.
-        route = event.router_data.get(constants.RouteVar.PATH, "")
-
-        # Add the on_load events and set is_hydrated to True.
-        events = [*app.get_load_events(route), type(state).set_is_hydrated(True)]  # type: ignore
-        events = fix_events(events, event.token)
+        state._clean()
 
         # Return the state update.
-        return StateUpdate(delta=delta, events=events)
+        return StateUpdate(delta=delta, events=[])

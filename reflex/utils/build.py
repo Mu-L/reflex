@@ -4,230 +4,233 @@ from __future__ import annotations
 
 import json
 import os
-import random
 import subprocess
+import zipfile
 from pathlib import Path
-from typing import Optional, Union
 
 from rich.progress import MofNCompleteColumn, Progress, TimeElapsedColumn
 
 from reflex import constants
 from reflex.config import get_config
-from reflex.utils import console, path_ops, prerequisites
-from reflex.utils.processes import new_process
+from reflex.utils import console, path_ops, prerequisites, processes
 
 
-def update_json_file(file_path: str, update_dict: dict[str, Union[int, str]]):
-    """Update the contents of a json file.
-
-    Args:
-        file_path: the path to the JSON file.
-        update_dict: object to update json.
-    """
-    fp = Path(file_path)
-    # create file if it doesn't exist
-    fp.touch(exist_ok=True)
-    # create an empty json object if file is empty
-    fp.write_text("{}") if fp.stat().st_size == 0 else None
-
-    with open(fp) as f:  # type: ignore
-        json_object: dict = json.load(f)
-        json_object.update(update_dict)
-    with open(fp, "w") as f:
-        json.dump(json_object, f, ensure_ascii=False)
-
-
-def set_reflex_project_hash():
-    """Write the hash of the Reflex project to a REFLEX_JSON."""
-    update_json_file(constants.REFLEX_JSON, {"project_hash": random.getrandbits(128)})
-
-
-def set_environment_variables():
+def set_env_json():
     """Write the upload url to a REFLEX_JSON."""
-    update_json_file(
-        constants.ENV_JSON,
-        {
-            "uploadUrl": constants.Endpoint.UPLOAD.get_url(),
-            "eventUrl": constants.Endpoint.EVENT.get_url(),
-            "pingUrl": constants.Endpoint.PING.get_url(),
-        },
+    path_ops.update_json_file(
+        str(prerequisites.get_web_dir() / constants.Dirs.ENV_JSON),
+        {endpoint.name: endpoint.get_url() for endpoint in constants.Endpoint},
     )
 
 
-def set_os_env(**kwargs):
-    """Set os environment variables.
-
-    Args:
-        kwargs: env key word args.
-    """
-    for key, value in kwargs.items():
-        if not value:
-            continue
-        os.environ[key.upper()] = value
-
-
-def generate_sitemap_config(deploy_url: str):
+def generate_sitemap_config(deploy_url: str, export=False):
     """Generate the sitemap config file.
 
     Args:
         deploy_url: The URL of the deployed app.
+        export: If the sitemap are generated for an export.
     """
     # Import here to avoid circular imports.
     from reflex.compiler import templates
 
-    config = json.dumps(
-        {
-            "siteUrl": deploy_url,
-            "generateRobotsTxt": True,
-        }
-    )
+    config = {
+        "siteUrl": deploy_url,
+        "generateRobotsTxt": True,
+    }
 
-    with open(constants.SITEMAP_CONFIG_FILE, "w") as f:
-        f.write(templates.SITEMAP_CONFIG(config=config))
+    if export:
+        config["outDir"] = constants.Dirs.STATIC
+
+    config = json.dumps(config)
+
+    sitemap = prerequisites.get_web_dir() / constants.Next.SITEMAP_CONFIG_FILE
+    sitemap.write_text(templates.SITEMAP_CONFIG(config=config))
 
 
-def export_app(
-    backend: bool = True,
-    frontend: bool = True,
-    zip: bool = False,
-    deploy_url: Optional[str] = None,
-    loglevel: constants.LogLevel = constants.LogLevel.ERROR,
-):
-    """Zip up the app for deployment.
+def _zip(
+    component_name: constants.ComponentName,
+    target: str | Path,
+    root_dir: str | Path,
+    exclude_venv_dirs: bool,
+    upload_db_file: bool = False,
+    dirs_to_exclude: set[str] | None = None,
+    files_to_exclude: set[str] | None = None,
+    top_level_dirs_to_exclude: set[str] | None = None,
+) -> None:
+    """Zip utility function.
 
     Args:
-        backend: Whether to zip up the backend app.
-        frontend: Whether to zip up the frontend app.
-        zip: Whether to zip the app.
-        deploy_url: The URL of the deployed app.
-        loglevel: The log level to use.
+        component_name: The name of the component: backend or frontend.
+        target: The target zip file.
+        root_dir: The root directory to zip.
+        exclude_venv_dirs: Whether to exclude venv directories.
+        upload_db_file: Whether to include local sqlite db files.
+        dirs_to_exclude: The directories to exclude.
+        files_to_exclude: The files to exclude.
+        top_level_dirs_to_exclude: The top level directory names immediately under root_dir to exclude. Do not exclude folders by these names further in the sub-directories.
+
     """
-    # Remove the static folder.
-    path_ops.rm(constants.WEB_STATIC_DIR)
+    target = Path(target)
+    root_dir = Path(root_dir)
+    dirs_to_exclude = dirs_to_exclude or set()
+    files_to_exclude = files_to_exclude or set()
+    files_to_zip: list[str] = []
+    # Traverse the root directory in a top-down manner. In this traversal order,
+    # we can modify the dirs list in-place to remove directories we don't want to include.
+    for root, dirs, files in os.walk(root_dir, topdown=True):
+        root = Path(root)
+        # Modify the dirs in-place so excluded and hidden directories are skipped in next traversal.
+        dirs[:] = [
+            d
+            for d in dirs
+            if (basename := Path(d).resolve().name) not in dirs_to_exclude
+            and not basename.startswith(".")
+            and (not exclude_venv_dirs or not _looks_like_venv_dir(root / d))
+        ]
+        # If we are at the top level with root_dir, exclude the top level dirs.
+        if top_level_dirs_to_exclude and root == root_dir:
+            dirs[:] = [d for d in dirs if d not in top_level_dirs_to_exclude]
+        # Modify the files in-place so the hidden files and db files are excluded.
+        files[:] = [
+            f
+            for f in files
+            if not f.startswith(".") and (upload_db_file or not f.endswith(".db"))
+        ]
+        files_to_zip += [
+            str(root / file) for file in files if file not in files_to_exclude
+        ]
 
-    # Generate the sitemap file.
-    command = "export"
-    if deploy_url is not None:
-        generate_sitemap_config(deploy_url)
-        command = "export-sitemap"
-
-    # Create a progress object
+    # Create a progress bar for zipping the component.
     progress = Progress(
         *Progress.get_default_columns()[:-1],
         MofNCompleteColumn(),
         TimeElapsedColumn(),
     )
+    task = progress.add_task(
+        f"Zipping {component_name.value}:", total=len(files_to_zip)
+    )
+
+    with progress, zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for file in files_to_zip:
+            console.debug(f"{target}: {file}", progress=progress)
+            progress.advance(task)
+            zipf.write(file, Path(file).relative_to(root_dir))
+
+
+def zip_app(
+    frontend: bool = True,
+    backend: bool = True,
+    zip_dest_dir: str | Path = Path.cwd(),
+    upload_db_file: bool = False,
+):
+    """Zip up the app.
+
+    Args:
+        frontend: Whether to zip up the frontend app.
+        backend: Whether to zip up the backend app.
+        zip_dest_dir: The directory to export the zip file to.
+        upload_db_file: Whether to upload the database file.
+    """
+    zip_dest_dir = Path(zip_dest_dir)
+    files_to_exclude = {
+        constants.ComponentName.FRONTEND.zip(),
+        constants.ComponentName.BACKEND.zip(),
+    }
+
+    if frontend:
+        _zip(
+            component_name=constants.ComponentName.FRONTEND,
+            target=zip_dest_dir / constants.ComponentName.FRONTEND.zip(),
+            root_dir=prerequisites.get_web_dir() / constants.Dirs.STATIC,
+            files_to_exclude=files_to_exclude,
+            exclude_venv_dirs=False,
+        )
+
+    if backend:
+        _zip(
+            component_name=constants.ComponentName.BACKEND,
+            target=zip_dest_dir / constants.ComponentName.BACKEND.zip(),
+            root_dir=Path.cwd(),
+            dirs_to_exclude={"__pycache__"},
+            files_to_exclude=files_to_exclude,
+            top_level_dirs_to_exclude={"assets"},
+            exclude_venv_dirs=True,
+            upload_db_file=upload_db_file,
+        )
+
+
+def build(
+    deploy_url: str | None = None,
+    for_export: bool = False,
+):
+    """Build the app for deployment.
+
+    Args:
+        deploy_url: The deployment URL.
+        for_export: Whether the build is for export.
+    """
+    wdir = prerequisites.get_web_dir()
+
+    # Clean the static directory if it exists.
+    path_ops.rm(str(wdir / constants.Dirs.STATIC))
+
+    # The export command to run.
+    command = "export"
 
     checkpoints = [
         "Linting and checking ",
-        "Compiled successfully",
+        "Creating an optimized production build",
         "Route (pages)",
+        "prerendered as static HTML",
         "Collecting page data",
-        "automatically rendered as static HTML",
-        'Copying "static build" directory',
-        'Copying "public" directory',
         "Finalizing page optimization",
-        "Export successful",
+        "Collecting build traces",
     ]
 
-    # Add a single task to the progress object
-    task = progress.add_task("Creating Production Build: ", total=len(checkpoints))
+    # Generate a sitemap if a deploy URL is provided.
+    if deploy_url is not None:
+        generate_sitemap_config(deploy_url, export=for_export)
+        command = "export-sitemap"
+
+        checkpoints.extend(["Loading next-sitemap", "Generation completed"])
 
     # Start the subprocess with the progress bar.
-    try:
-        with progress, new_process(
-            [prerequisites.get_package_manager(), "run", command],
-            cwd=constants.WEB_DIR,
-        ) as export_process:
-            assert export_process.stdout is not None, "No stdout for export process."
-            for line in export_process.stdout:
-                if loglevel == constants.LogLevel.DEBUG:
-                    print(line, end="")
-
-                # Check for special strings and update the progress bar.
-                for special_string in checkpoints:
-                    if special_string in line:
-                        if special_string == checkpoints[-1]:
-                            progress.update(task, completed=len(checkpoints))
-                            break  # Exit the loop if the completion message is found
-                        else:
-                            progress.update(task, advance=1)
-                            break
-
-    except Exception as e:
-        console.print(f"[red]Export process errored: {e}")
-        console.print(
-            "[red]Run in with [bold]--loglevel debug[/bold] to see the full error."
-        )
-        os._exit(1)
-
-    # Zip up the app.
-    if zip:
-        if os.name == "posix":
-            posix_export(backend, frontend)
-        if os.name == "nt":
-            nt_export(backend, frontend)
-
-
-def nt_export(backend: bool = True, frontend: bool = True):
-    """Export for nt (Windows) systems.
-
-    Args:
-        backend: Whether to zip up the backend app.
-        frontend: Whether to zip up the frontend app.
-    """
-    cmd = r""
-    if frontend:
-        cmd = r'''powershell -Command "Set-Location .web/_static; Compress-Archive -Path .\* -DestinationPath ..\..\frontend.zip -Force"'''
-        os.system(cmd)
-    if backend:
-        cmd = r'''powershell -Command "Get-ChildItem -File | Where-Object { $_.Name -notin @('.web', 'assets', 'frontend.zip', 'backend.zip') } | Compress-Archive -DestinationPath backend.zip -Update"'''
-        os.system(cmd)
-
-
-def posix_export(backend: bool = True, frontend: bool = True):
-    """Export for posix (Linux, OSX) systems.
-
-    Args:
-        backend: Whether to zip up the backend app.
-        frontend: Whether to zip up the frontend app.
-    """
-    cmd = r""
-    if frontend:
-        cmd = r"cd .web/_static && zip -r ../../frontend.zip ./*"
-        os.system(cmd)
-    if backend:
-        cmd = r"zip -r backend.zip ./* -x .web/\* ./assets\* ./frontend.zip\* ./backend.zip\*"
-        os.system(cmd)
+    process = processes.new_process(
+        [prerequisites.get_package_manager(), "run", command],
+        cwd=wdir,
+        shell=constants.IS_WINDOWS,
+    )
+    processes.show_progress("Creating Production Build", process, checkpoints)
 
 
 def setup_frontend(
     root: Path,
-    loglevel: constants.LogLevel = constants.LogLevel.ERROR,
     disable_telemetry: bool = True,
 ):
     """Set up the frontend to run the app.
 
     Args:
         root: The root path of the project.
-        loglevel: The log level to use.
         disable_telemetry: Whether to disable the Next telemetry.
     """
-    # Install frontend packages.
-    prerequisites.install_frontend_packages()
+    # Create the assets dir if it doesn't exist.
+    path_ops.mkdir(constants.Dirs.APP_ASSETS)
 
     # Copy asset files to public folder.
     path_ops.cp(
-        src=str(root / constants.APP_ASSETS_DIR),
-        dest=str(root / constants.WEB_ASSETS_DIR),
+        src=str(root / constants.Dirs.APP_ASSETS),
+        dest=str(root / prerequisites.get_web_dir() / constants.Dirs.PUBLIC),
     )
 
     # Set the environment variables in client (env.json).
-    set_environment_variables()
+    set_env_json()
+
+    # update the last reflex run time.
+    prerequisites.set_last_reflex_run_time()
 
     # Disable the Next telemetry.
     if disable_telemetry:
-        new_process(
+        processes.new_process(
             [
                 prerequisites.get_package_manager(),
                 "run",
@@ -235,22 +238,26 @@ def setup_frontend(
                 "telemetry",
                 "disable",
             ],
-            cwd=constants.WEB_DIR,
+            cwd=prerequisites.get_web_dir(),
             stdout=subprocess.DEVNULL,
+            shell=constants.IS_WINDOWS,
         )
 
 
 def setup_frontend_prod(
     root: Path,
-    loglevel: constants.LogLevel = constants.LogLevel.ERROR,
     disable_telemetry: bool = True,
 ):
     """Set up the frontend for prod mode.
 
     Args:
         root: The root path of the project.
-        loglevel: The log level to use.
         disable_telemetry: Whether to disable the Next telemetry.
     """
-    setup_frontend(root, loglevel, disable_telemetry)
-    export_app(loglevel=loglevel, deploy_url=get_config().deploy_url)
+    setup_frontend(root, disable_telemetry)
+    build(deploy_url=get_config().deploy_url)
+
+
+def _looks_like_venv_dir(dir_to_check: str | Path) -> bool:
+    dir_to_check = Path(dir_to_check)
+    return (dir_to_check / "pyvenv.cfg").exists()

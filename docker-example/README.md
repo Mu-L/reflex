@@ -1,38 +1,30 @@
-# Reflex Container Image Build
+# Reflex Docker Examples
 
-This example describes how to create and use a container image for Reflex with your own code.
+This directory contains several examples of how to deploy Reflex apps using docker.
 
-## Update Requirements
+In all cases, ensure that your `requirements.txt` file is up to date and
+includes the `reflex` package.
 
-The `requirements.txt` includes the reflex package which is need to install Reflex framework. If you use additional packages in your project you have add this in the `requirements.txt` first. Copy the `Dockerfile` and the `requirements.txt` file in your project folder.
+## `simple-two-port`
 
-## Customize Reflex Config
+The most basic production deployment exposes two HTTP ports and relies on an
+existing load balancer to forward the traffic appropriately.
 
-The `rxconfig.py` includes the configuration of your Reflex service. Edit the file like the following configuration. If you want to use a custom database you can set the endpoint in this file.
+## `simple-one-port`
 
-```python
-import reflex as rx
+This deployment exports the frontend statically and serves it via a single HTTP
+port using Caddy. This is useful for platforms that only support a single port
+or where running a node server in the container is undesirable.
 
-config = rx.Config(
-    app_name="app",
-    api_url="0.0.0.0:8000",
-    bun_path="/app/.bun/bin/bun",
-    db_url="sqlite:///reflex.db",
-)
-```
+## `production-compose`
 
-## Build Reflex Container Image
+This deployment is intended for use with a standalone VPS that is only hosting a
+single Reflex app. It provides the entire stack in a single `compose.yaml`
+including a webserver, one or more backend instances, redis, and a postgres
+database.
 
-To build your container image run the following command:
+## `production-app-platform`
 
-```bash
-docker build -t reflex-project:latest .
-```
-
-## Start Container Service
-
-Finally, you can start your Reflex container service as follows:
-
-```bash
-docker run -d -p 3000:3000 -p 8000:8000 --name reflex reflex-project:latest
-```
+This example deployment is intended for use with App hosting platforms, like
+Azure, AWS, or Google Cloud Run. It is the backend of the deployment, which
+depends on a separately hosted redis instance and static frontend deployment.

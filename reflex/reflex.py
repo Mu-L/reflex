@@ -1,20 +1,33 @@
 """Reflex CLI to create, run, and deploy apps."""
 
-import os
-import signal
-import threading
+from __future__ import annotations
+
+import atexit
 from pathlib import Path
+from typing import List, Optional
 
-import httpx
 import typer
-from alembic.util.exc import CommandError
+import typer.core
+from reflex_cli.v2.deployments import check_version, hosting_cli
 
-from reflex import constants, model
-from reflex.config import get_config
-from reflex.utils import build, console, exec, prerequisites, processes, telemetry
+from reflex import constants
+from reflex.config import environment, get_config
+from reflex.custom_components.custom_components import custom_components_cli
+from reflex.state import reset_disk_state_manager
+from reflex.utils import console, telemetry
+
+# Disable typer+rich integration for help panels
+typer.core.rich = None  # type: ignore
 
 # Create the app.
-cli = typer.Typer()
+try:
+    cli = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
+except TypeError:
+    # Fallback for older typer versions.
+    cli = typer.Typer(add_completion=False)
+
+# Get the config.
+config = get_config()
 
 
 def version(value: bool):
@@ -27,7 +40,7 @@ def version(value: bool):
         typer.Exit: If the version flag was passed.
     """
     if value:
-        console.print(constants.VERSION)
+        console.print(constants.Reflex.VERSION)
         raise typer.Exit()
 
 
@@ -35,104 +48,142 @@ def version(value: bool):
 def main(
     version: bool = typer.Option(
         None,
-        "--version",
         "-v",
+        "--version",
         callback=version,
         help="Get the Reflex version.",
         is_eager=True,
     ),
 ):
-    """Reflex CLI global configuration."""
+    """Reflex CLI to create, run, and deploy apps."""
     pass
 
 
-@cli.command()
-def init(
-    name: str = typer.Option(None, help="Name of the app to be initialized."),
-    template: constants.Template = typer.Option(
-        constants.Template.DEFAULT, help="Template to use for the app."
-    ),
+def _init(
+    name: str,
+    template: str | None = None,
+    loglevel: constants.LogLevel = config.loglevel,
+    ai: bool = False,
 ):
-    """Initialize a new Reflex app in the current directory."""
-    # Get the app name.
-    app_name = prerequisites.get_default_app_name() if name is None else name
+    """Initialize a new Reflex app in the given directory."""
+    from reflex.utils import exec, prerequisites
+
+    # Set the log level.
+    console.set_log_level(loglevel)
+
+    # Show system info
+    exec.output_system_info()
+
+    # Validate the app name.
+    app_name = prerequisites.validate_app_name(name)
     console.rule(f"[bold]Initializing {app_name}")
+
+    # Check prerequisites.
+    prerequisites.check_latest_package_version(constants.Reflex.MODULE_NAME)
+    prerequisites.initialize_reflex_user_directory()
+    prerequisites.ensure_reflex_installation_id()
 
     # Set up the web project.
     prerequisites.initialize_frontend_dependencies()
 
-    # Migrate Pynecone projects to Reflex.
-    prerequisites.migrate_to_reflex()
-
-    # Set up the app directory, only if the config doesn't exist.
-    config = get_config()
-    if not os.path.exists(constants.CONFIG_FILE):
-        prerequisites.create_config(app_name)
-        prerequisites.initialize_app_directory(app_name, template)
-        build.set_reflex_project_hash()
-        telemetry.send("init", config.telemetry_enabled)
-    else:
-        telemetry.send("reinit", config.telemetry_enabled)
+    # Initialize the app.
+    template = prerequisites.initialize_app(app_name, template, ai)
 
     # Initialize the .gitignore.
     prerequisites.initialize_gitignore()
 
+    # Initialize the requirements.txt.
+    prerequisites.initialize_requirements_txt()
+
+    template_msg = f" using the {template} template" if template else ""
     # Finish initializing the app.
-    console.log(f"[bold green]Finished Initializing: {app_name}")
+    console.success(f"Initialized {app_name}{template_msg}")
 
 
 @cli.command()
-def run(
-    env: constants.Env = typer.Option(
-        get_config().env, help="The environment to run the app in."
+def init(
+    name: str = typer.Option(
+        None, metavar="APP_NAME", help="The name of the app to initialize."
     ),
-    frontend: bool = typer.Option(
-        False, "--frontend-only", help="Execute only frontend."
+    template: str = typer.Option(
+        None,
+        help="The template to initialize the app with.",
     ),
-    backend: bool = typer.Option(False, "--backend-only", help="Execute only backend."),
     loglevel: constants.LogLevel = typer.Option(
-        constants.LogLevel.ERROR, help="The log level to use."
+        config.loglevel, help="The log level to use."
     ),
-    frontend_port: str = typer.Option(None, help="Specify a different frontend port."),
-    backend_port: str = typer.Option(None, help="Specify a different backend port."),
-    backend_host: str = typer.Option(None, help="Specify the backend host."),
+    ai: bool = typer.Option(
+        False,
+        help="Use AI to create the initial template. Cannot be used with existing app or `--template` option.",
+    ),
 ):
-    """Run the app in the current directory."""
-    # Check that the app is initialized.
-    prerequisites.check_initialized(frontend=frontend)
+    """Initialize a new Reflex app in the current directory."""
+    _init(name, template, loglevel, ai)
 
-    # Set ports as os env variables to take precedence over config and
-    # .env variables(if override_os_envs flag in config is set to False).
-    build.set_os_env(
-        frontend_port=frontend_port,
-        backend_port=backend_port,
-        backend_host=backend_host,
-    )
 
-    # Get the ports from the config.
-    config = get_config()
-    frontend_port = config.frontend_port if frontend_port is None else frontend_port
-    backend_port = config.backend_port if backend_port is None else backend_port
-    backend_host = config.backend_host if backend_host is None else backend_host
+def _run(
+    env: constants.Env = constants.Env.DEV,
+    frontend: bool = True,
+    backend: bool = True,
+    frontend_port: str = str(config.frontend_port),
+    backend_port: str = str(config.backend_port),
+    backend_host: str = config.backend_host,
+    loglevel: constants.LogLevel = config.loglevel,
+):
+    """Run the app in the given directory."""
+    from reflex.utils import build, exec, prerequisites, processes
+
+    # Set the log level.
+    console.set_log_level(loglevel)
+
+    # Set env mode in the environment
+    environment.REFLEX_ENV_MODE.set(env)
+
+    # Show system info
+    exec.output_system_info()
 
     # If no --frontend-only and no --backend-only, then turn on frontend and backend both
     if not frontend and not backend:
         frontend = True
         backend = True
 
-    # If something is running on the ports, ask the user if they want to kill or change it.
-    if frontend and processes.is_process_on_port(frontend_port):
-        frontend_port = processes.change_or_terminate_port(frontend_port, "frontend")
+    if not frontend and backend:
+        _skip_compile()
 
-    if backend and processes.is_process_on_port(backend_port):
-        backend_port = processes.change_or_terminate_port(backend_port, "backend")
+    # Check that the app is initialized.
+    if prerequisites.needs_reinit(frontend=frontend):
+        _init(name=config.app_name, loglevel=loglevel)
 
-    # Get the app module.
+    # Delete the states folder if it exists.
+    reset_disk_state_manager()
+
+    # Find the next available open port if applicable.
+    if frontend:
+        frontend_port = processes.handle_port(
+            "frontend", frontend_port, str(constants.DefaultPorts.FRONTEND_PORT)
+        )
+
+    if backend:
+        backend_port = processes.handle_port(
+            "backend", backend_port, str(constants.DefaultPorts.BACKEND_PORT)
+        )
+
+    # Apply the new ports to the config.
+    if frontend_port != str(config.frontend_port):
+        config._set_persistent(frontend_port=frontend_port)
+    if backend_port != str(config.backend_port):
+        config._set_persistent(backend_port=backend_port)
+
+    # Reload the config to make sure the env vars are persistent.
+    get_config(reload=True)
+
     console.rule("[bold]Starting Reflex App")
-    app = prerequisites.get_app()
 
-    # Check the admin dashboard settings.
-    prerequisites.check_admin_settings()
+    prerequisites.check_latest_package_version(constants.Reflex.MODULE_NAME)
+
+    if frontend:
+        # Get the app module.
+        prerequisites.get_compiled_app()
 
     # Warn if schema is not up to date.
     prerequisites.check_schema_up_to_date()
@@ -151,59 +202,87 @@ def run(
             exec.run_frontend_prod,
             exec.run_backend_prod,
         )
-    assert setup_frontend and frontend_cmd and backend_cmd, "Invalid env"
+    if not setup_frontend or not frontend_cmd or not backend_cmd:
+        raise ValueError("Invalid env")
 
     # Post a telemetry event.
-    telemetry.send(f"run-{env.value}", config.telemetry_enabled)
-
-    # Run the frontend and backend.
-    if frontend:
-        setup_frontend(Path.cwd(), loglevel)
-        threading.Thread(
-            target=frontend_cmd, args=(Path.cwd(), frontend_port, loglevel)
-        ).start()
-    if backend:
-        threading.Thread(
-            target=backend_cmd,
-            args=(app.__name__, backend_host, backend_port, loglevel),
-        ).start()
+    telemetry.send(f"run-{env.value}")
 
     # Display custom message when there is a keyboard interrupt.
-    signal.signal(signal.SIGINT, processes.catch_keyboard_interrupt)
+    atexit.register(processes.atexit_handler)
+
+    # Run the frontend and backend together.
+    commands = []
+
+    # Run the frontend on a separate thread.
+    if frontend:
+        setup_frontend(Path.cwd())
+        commands.append((frontend_cmd, Path.cwd(), frontend_port, backend))
+
+    # In prod mode, run the backend on a separate thread.
+    if backend and env == constants.Env.PROD:
+        commands.append(
+            (
+                backend_cmd,
+                backend_host,
+                backend_port,
+                loglevel.subprocess_level(),
+                frontend,
+            )
+        )
+
+    # Start the frontend and backend.
+    with processes.run_concurrently_context(*commands):
+        # In dev mode, run the backend on the main thread.
+        if backend and env == constants.Env.DEV:
+            backend_cmd(
+                backend_host, int(backend_port), loglevel.subprocess_level(), frontend
+            )
+            # The windows uvicorn bug workaround
+            # https://github.com/reflex-dev/reflex/issues/2335
+            if constants.IS_WINDOWS and exec.frontend_process:
+                # Sends SIGTERM in windows
+                exec.kill(exec.frontend_process.pid)
 
 
 @cli.command()
-def deploy(dry_run: bool = typer.Option(False, help="Whether to run a dry run.")):
-    """Deploy the app to the Reflex hosting service."""
-    # Get the app config.
-    config = get_config()
+def run(
+    env: constants.Env = typer.Option(
+        constants.Env.DEV, help="The environment to run the app in."
+    ),
+    frontend: bool = typer.Option(
+        False,
+        "--frontend-only",
+        help="Execute only frontend.",
+        envvar=environment.REFLEX_FRONTEND_ONLY.name,
+    ),
+    backend: bool = typer.Option(
+        False,
+        "--backend-only",
+        help="Execute only backend.",
+        envvar=environment.REFLEX_BACKEND_ONLY.name,
+    ),
+    frontend_port: str = typer.Option(
+        config.frontend_port, help="Specify a different frontend port."
+    ),
+    backend_port: str = typer.Option(
+        config.backend_port, help="Specify a different backend port."
+    ),
+    backend_host: str = typer.Option(
+        config.backend_host, help="Specify the backend host."
+    ),
+    loglevel: constants.LogLevel = typer.Option(
+        config.loglevel, help="The log level to use."
+    ),
+):
+    """Run the app in the current directory."""
+    if frontend and backend:
+        console.error("Cannot use both --frontend-only and --backend-only options.")
+        raise typer.Exit(1)
+    environment.REFLEX_BACKEND_ONLY.set(backend)
+    environment.REFLEX_FRONTEND_ONLY.set(frontend)
 
-    # Check if the deploy url is set.
-    if config.rxdeploy_url is None:
-        typer.echo("This feature is coming soon!")
-        return
-
-    # Compile the app in production mode.
-    typer.echo("Compiling production app")
-    export()
-
-    # Exit early if this is a dry run.
-    if dry_run:
-        return
-
-    # Deploy the app.
-    data = {"userId": config.username, "projectId": config.app_name}
-    original_response = httpx.get(config.rxdeploy_url, params=data)
-    response = original_response.json()
-    frontend = response["frontend_resources_url"]
-    backend = response["backend_resources_url"]
-
-    # Upload the frontend and backend.
-    with open(constants.FRONTEND_ZIP, "rb") as f:
-        httpx.put(frontend, data=f)  # type: ignore
-
-    with open(constants.BACKEND_ZIP, "rb") as f:
-        httpx.put(backend, data=f)  # type: ignore
+    _run(env, frontend, backend, frontend_port, backend_port, backend_host, loglevel)
 
 
 @cli.command()
@@ -217,61 +296,97 @@ def export(
     backend: bool = typer.Option(
         True, "--frontend-only", help="Export only frontend.", show_default=False
     ),
+    zip_dest_dir: str = typer.Option(
+        str(Path.cwd()),
+        help="The directory to export the zip files to.",
+        show_default=False,
+    ),
+    upload_db_file: bool = typer.Option(
+        False,
+        help="Whether to exclude sqlite db files when exporting backend.",
+        hidden=True,
+    ),
+    loglevel: constants.LogLevel = typer.Option(
+        config.loglevel, help="The log level to use."
+    ),
 ):
     """Export the app to a zip file."""
-    # Check that the app is initialized.
-    prerequisites.check_initialized(frontend=frontend)
+    from reflex.utils import export as export_utils
+    from reflex.utils import prerequisites
 
-    # Compile the app in production mode and export it.
-    console.rule("[bold]Compiling production app and preparing for export.")
+    if prerequisites.needs_reinit(frontend=True):
+        _init(name=config.app_name, loglevel=loglevel)
 
-    if frontend:
-        # Ensure module can be imported and app.compile() is called.
-        prerequisites.get_app()
-        # Set up .web directory and install frontend dependencies.
-        build.setup_frontend(Path.cwd())
-
-    # Export the app.
-    config = get_config()
-    build.export_app(
-        backend=backend,
+    export_utils.export(
+        zipping=zipping,
         frontend=frontend,
-        zip=zipping,
-        deploy_url=config.deploy_url,
+        backend=backend,
+        zip_dest_dir=zip_dest_dir,
+        upload_db_file=upload_db_file,
+        loglevel=loglevel.subprocess_level(),
     )
 
-    # Post a telemetry event.
-    telemetry.send("export", config.telemetry_enabled)
 
-    if zipping:
-        console.rule(
-            """Backend & Frontend compiled. See [green bold]backend.zip[/green bold]
-            and [green bold]frontend.zip[/green bold]."""
-        )
-    else:
-        console.rule(
-            """Backend & Frontend compiled. See [green bold]app[/green bold]
-            and [green bold].web/_static[/green bold] directories."""
-        )
+@cli.command()
+def login(loglevel: constants.LogLevel = typer.Option(config.loglevel)):
+    """Authenticate with experimental Reflex hosting service."""
+    from reflex_cli.v2 import cli as hosting_cli
+
+    check_version()
+
+    validated_info = hosting_cli.login()
+    if validated_info is not None:
+        _skip_compile()  # Allow running outside of an app dir
+        telemetry.send("login", user_uuid=validated_info.get("user_id"))
+
+
+@cli.command()
+def logout(
+    loglevel: constants.LogLevel = typer.Option(
+        config.loglevel, help="The log level to use."
+    ),
+):
+    """Log out of access to Reflex hosting service."""
+    from reflex_cli.v2.cli import logout
+
+    check_version()
+
+    logout(loglevel)  # type: ignore
 
 
 db_cli = typer.Typer()
+script_cli = typer.Typer()
+
+
+def _skip_compile():
+    """Skip the compile step."""
+    environment.REFLEX_SKIP_COMPILE.set(True)
 
 
 @db_cli.command(name="init")
 def db_init():
     """Create database schema and migration configuration."""
-    if get_config().db_url is None:
-        console.print("[red]db_url is not configured, cannot initialize.")
-    if Path(constants.ALEMBIC_CONFIG).exists():
-        console.print(
-            "[red]Database is already initialized. Use "
+    from reflex import model
+    from reflex.utils import prerequisites
+
+    # Check the database url.
+    if config.db_url is None:
+        console.error("db_url is not configured, cannot initialize.")
+        return
+
+    # Check the alembic config.
+    if environment.ALEMBIC_CONFIG.get().exists():
+        console.error(
+            "Database is already initialized. Use "
             "[bold]reflex db makemigrations[/bold] to create schema change "
             "scripts and [bold]reflex db migrate[/bold] to apply migrations "
             "to a new or existing database.",
         )
         return
-    prerequisites.get_app()
+
+    # Initialize the database.
+    _skip_compile()
+    prerequisites.get_compiled_app()
     model.Model.alembic_init()
     model.Model.migrate(autogenerate=True)
 
@@ -279,7 +394,12 @@ def db_init():
 @db_cli.command()
 def migrate():
     """Create or update database schema from migration scripts."""
-    prerequisites.get_app()
+    from reflex import model
+    from reflex.utils import prerequisites
+
+    # TODO see if we can use `get_app()` instead (no compile).  Would _skip_compile still be needed then?
+    _skip_compile()
+    prerequisites.get_compiled_app()
     if not prerequisites.check_db_initialized():
         return
     model.Model.migrate()
@@ -293,7 +413,14 @@ def makemigrations(
     ),
 ):
     """Create autogenerated alembic migration scripts."""
-    prerequisites.get_app()
+    from alembic.util.exc import CommandError
+
+    from reflex import model
+    from reflex.utils import prerequisites
+
+    # TODO see if we can use `get_app()` instead (no compile).  Would _skip_compile still be needed then?
+    _skip_compile()
+    prerequisites.get_compiled_app()
     if not prerequisites.check_db_initialized():
         return
     with model.Model.get_db_engine().connect() as connection:
@@ -302,12 +429,138 @@ def makemigrations(
         except CommandError as command_error:
             if "Target database is not up to date." not in str(command_error):
                 raise
-            console.print(
-                f"[red]{command_error} Run [bold]reflex db migrate[/bold] to update database."
+            console.error(
+                f"{command_error} Run [bold]reflex db migrate[/bold] to update database."
             )
 
 
+@cli.command()
+def deploy(
+    app_name: str = typer.Option(
+        config.app_name,
+        "--app-name",
+        help="The name of the App to deploy under.",
+        hidden=True,
+    ),
+    regions: List[str] = typer.Option(
+        [],
+        "-r",
+        "--region",
+        help="The regions to deploy to. `reflex cloud regions` For multiple envs, repeat this option, e.g. --region sjc --region iad",
+    ),
+    envs: List[str] = typer.Option(
+        [],
+        "--env",
+        help="The environment variables to set: <key>=<value>. For multiple envs, repeat this option, e.g. --env k1=v2 --env k2=v2.",
+    ),
+    vmtype: Optional[str] = typer.Option(
+        None,
+        "--vmtype",
+        help="Vm type id. Run `reflex cloud vmtypes` to get options.",
+    ),
+    hostname: Optional[str] = typer.Option(
+        None,
+        "--hostname",
+        help="The hostname of the frontend.",
+    ),
+    interactive: bool = typer.Option(
+        True,
+        help="Whether to list configuration options and ask for confirmation.",
+    ),
+    envfile: Optional[str] = typer.Option(
+        None,
+        "--envfile",
+        help="The path to an env file to use. Will override any envs set manually.",
+    ),
+    loglevel: constants.LogLevel = typer.Option(
+        config.loglevel, help="The log level to use."
+    ),
+    project: Optional[str] = typer.Option(
+        None,
+        "--project",
+        help="project id to deploy to",
+    ),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        help="token to use for auth",
+    ),
+    config_path: Optional[str] = typer.Option(
+        None,
+        "--config",
+        help="path to the config file",
+    ),
+):
+    """Deploy the app to the Reflex hosting service."""
+    from reflex_cli.utils import dependency
+    from reflex_cli.v2 import cli as hosting_cli
+
+    from reflex.utils import export as export_utils
+    from reflex.utils import prerequisites
+
+    check_version()
+
+    # Set the log level.
+    console.set_log_level(loglevel)
+
+    if not token:
+        # make sure user is logged in.
+        if interactive:
+            hosting_cli.login()
+        else:
+            raise SystemExit("Token is required for non-interactive mode.")
+
+    # Only check requirements if interactive.
+    # There is user interaction for requirements update.
+    if interactive:
+        dependency.check_requirements()
+
+    # Check if we are set up.
+    if prerequisites.needs_reinit(frontend=True):
+        _init(name=config.app_name, loglevel=loglevel)
+    prerequisites.check_latest_package_version(constants.ReflexHostingCLI.MODULE_NAME)
+
+    hosting_cli.deploy(
+        app_name=app_name,
+        export_fn=lambda zip_dest_dir,
+        api_url,
+        deploy_url,
+        frontend,
+        backend,
+        zipping: export_utils.export(
+            zip_dest_dir=zip_dest_dir,
+            api_url=api_url,
+            deploy_url=deploy_url,
+            frontend=frontend,
+            backend=backend,
+            zipping=zipping,
+            loglevel=loglevel.subprocess_level(),
+        ),
+        regions=regions,
+        envs=envs,
+        vmtype=vmtype,
+        envfile=envfile,
+        hostname=hostname,
+        interactive=interactive,
+        loglevel=type(loglevel).INFO,  # type: ignore
+        token=token,
+        project=project,
+        config_path=config_path,
+    )
+
+
 cli.add_typer(db_cli, name="db", help="Subcommands for managing the database schema.")
+cli.add_typer(script_cli, name="script", help="Subcommands running helper scripts.")
+cli.add_typer(
+    hosting_cli,
+    name="cloud",
+    help="Subcommands for managing the reflex cloud.",
+)
+cli.add_typer(
+    custom_components_cli,
+    name="component",
+    help="Subcommands for creating and publishing Custom Components.",
+)
 
 if __name__ == "__main__":
     cli()

@@ -3,49 +3,8 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Union
 
 from reflex import constants
-from reflex.event import EventHandler
-from reflex.page import page
-from reflex.utils.console import deprecate
-
-
-def route(
-    route: Optional[str] = None,
-    title: Optional[str] = None,
-    image: Optional[str] = None,
-    description: Optional[str] = None,
-    on_load: Optional[Union[EventHandler, List[EventHandler]]] = None,
-):
-    """Decorate a function as a page.
-
-    rx.App() will automatically call add_page() for any method decorated with route
-    when App.compile is called.
-
-    All defaults are None because they will use the one from add_page().
-
-    Note: the decorated functions still need to be imported.
-
-    Args:
-        route: The route to reach the page.
-        title: The title of the page.
-        image: The favicon of the page.
-        description: The description of the page
-        on_load: The event handler(s) called when the page load.
-
-    Returns:
-        The decorated function.
-    """
-    deprecate("@rx.route is deprecated and is being replaced by @rx.page instead")
-
-    return page(
-        route=route,
-        title=title,
-        image=image,
-        description=description,
-        on_load=on_load,
-    )
 
 
 def verify_route_validity(route: str) -> None:
@@ -60,9 +19,13 @@ def verify_route_validity(route: str) -> None:
     pattern = catchall_in_route(route)
     if pattern and not route.endswith(pattern):
         raise ValueError(f"Catch-all must be the last part of the URL: {route}")
+    if route == "api" or route.startswith("api/"):
+        raise ValueError(
+            f"Cannot have a route prefixed with 'api/': {route} (conflicts with NextJS)"
+        )
 
 
-def get_route_args(route: str) -> Dict[str, str]:
+def get_route_args(route: str) -> dict[str, str]:
     """Get the dynamic arguments for the given route.
 
     Args:
@@ -138,3 +101,42 @@ def catchall_prefix(route: str) -> str:
     """
     pattern = catchall_in_route(route)
     return route.replace(pattern, "") if pattern else ""
+
+
+def replace_brackets_with_keywords(input_string):
+    """Replace brackets and everything inside it in a string with a keyword.
+
+    Args:
+        input_string: String to replace.
+
+    Returns:
+        new string containing keywords.
+    """
+    # /posts -> /post
+    # /posts/[slug] -> /posts/__SINGLE_SEGMENT__
+    # /posts/[slug]/comments -> /posts/__SINGLE_SEGMENT__/comments
+    # /posts/[[slug]] -> /posts/__DOUBLE_SEGMENT__
+    # / posts/[[...slug2]]-> /posts/__DOUBLE_CATCHALL_SEGMENT__
+    # /posts/[...slug3]-> /posts/__SINGLE_CATCHALL_SEGMENT__
+
+    # Replace [[...<slug>]] with __DOUBLE_CATCHALL_SEGMENT__
+    output_string = re.sub(
+        r"\[\[\.\.\..+?\]\]",
+        constants.RouteRegex.DOUBLE_CATCHALL_SEGMENT,
+        input_string,
+    )
+    # Replace [...<slug>] with __SINGLE_CATCHALL_SEGMENT__
+    output_string = re.sub(
+        r"\[\.\.\..+?\]",
+        constants.RouteRegex.SINGLE_CATCHALL_SEGMENT,
+        output_string,
+    )
+    # Replace [[<slug>]] with __DOUBLE_SEGMENT__
+    output_string = re.sub(
+        r"\[\[.+?\]\]", constants.RouteRegex.DOUBLE_SEGMENT, output_string
+    )
+    # Replace [<slug>] with __SINGLE_SEGMENT__
+    output_string = re.sub(
+        r"\[.+?\]", constants.RouteRegex.SINGLE_SEGMENT, output_string
+    )
+    return output_string

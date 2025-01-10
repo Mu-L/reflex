@@ -1,48 +1,37 @@
 #!/bin/bash
 
-kill_descendant_processes() {
-    local pid="$1"
-    local and_self="${2:-false}"
-    if children="$(pgrep -P "$pid")"; then
-        for child in $children; do
-            kill_descendant_processes "$child" true
-        done
-    fi
-    if [[ "$and_self" == true ]]; then
-        kill -9 "$pid"
-    fi
-}
-
 # Change directory to the first argument passed to the script
-cd "$1" || exit 1
-echo "Changed directory to $1"
+project_dir=$1
+shift
+pushd "$project_dir" || exit 1
+echo "Changed directory to $project_dir"
+
+# So we get stdout / stderr from Python ASAP. Without this, delays can be very long (e.g. on Windows, Github Actions)
+export PYTHONUNBUFFERED=1
+
+env_mode=$1
+shift
+check_ports=${1:-3000 8000}
+shift
 
 # Start the server in the background
-poetry run reflex run --env "$2" & pid=$!
+export TELEMETRY_ENABLED=false
+reflex run --loglevel debug --env "$env_mode" "$@" & pid=$!
+
+# Within the context of this bash, $pid_in_bash is what we need to pass to "kill" on exit
+# This is true on all platforms.
+pid_in_bash=$pid
+trap "kill -INT $pid_in_bash ||:" EXIT
+
 echo "Started server with PID $pid"
 
-# Wait for ports 3000 and 8000 to become available
-wait_time=0
-while ! nc -z localhost 3000 || ! lsof -i :8000 >/dev/null; do
-  if ! kill -0 "$pid" >/dev/null 2>&1; then
-      echo "Error: Server process with PID $pid exited early"
-      break
-  fi
-  if ((wait_time >= 600)); then
-    echo "Error: Timeout waiting for ports 3000 and 8000 to become available"
-    exit 1
-  fi
-  sleep 5
-  ((wait_time += 5))
-  echo "Waiting for ports 3000 and 8000 to become available (waited $wait_time seconds)..."
-done
+# Assume we run from the root of the repo
+popd
 
-# Check if the server is still running
-if kill -0 "$pid" >/dev/null 2>&1; then
-  echo "Integration test passed"
-  kill_descendant_processes $$
-  exit 0
-else
-  echo "Integration test failed"
-  exit 1
+# In Windows, our Python script below needs to work with the WINPID
+if [ -f /proc/$pid/winpid ]; then
+  pid=$(cat /proc/$pid/winpid)
+  echo "Windows detected, passing winpid $pid to port waiter"
 fi
+
+python scripts/wait_for_listening_port.py $check_ports --timeout=900 --server-pid "$pid"

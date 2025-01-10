@@ -2,22 +2,23 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Union
+from collections import defaultdict
+from typing import Any, Dict, List
 
-from reflex.components.component import Component
-from reflex.event import EventHandler
+from reflex.config import get_config
+from reflex.event import BASE_STATE, EventType
 
-DECORATED_PAGES = []
+DECORATED_PAGES: Dict[str, List] = defaultdict(list)
 
 
 def page(
-    route: Optional[str] = None,
-    title: Optional[str] = None,
-    image: Optional[str] = None,
-    description: Optional[str] = None,
-    meta: Optional[str] = None,
-    script_tags: Optional[List[Component]] = None,
-    on_load: Optional[Union[EventHandler, List[EventHandler]]] = None,
+    route: str | None = None,
+    title: str | None = None,
+    image: str | None = None,
+    description: str | None = None,
+    meta: list[Any] | None = None,
+    script_tags: list[Any] | None = None,
+    on_load: EventType[[], BASE_STATE] | None = None,
 ):
     """Decorate a function as a page.
 
@@ -33,14 +34,13 @@ def page(
         title: The title of the page.
         image: The favicon of the page.
         description: The description of the page.
-        meta: Additionnal meta to add to the page.
+        meta: Additional meta to add to the page.
         on_load: The event handler(s) called when the page load.
         script_tags: scripts to attach to the page
 
     Returns:
         The decorated function.
     """
-    ...
 
     def decorator(render_fn):
         kwargs = {}
@@ -59,8 +59,27 @@ def page(
         if on_load:
             kwargs["on_load"] = on_load
 
-        DECORATED_PAGES.append((render_fn, kwargs))
+        DECORATED_PAGES[get_config().app_name].append((render_fn, kwargs))
 
         return render_fn
 
     return decorator
+
+
+def get_decorated_pages(omit_implicit_routes=True) -> list[dict[str, Any]]:
+    """Get the decorated pages.
+
+    Args:
+        omit_implicit_routes: Whether to omit pages where the route will be implicitly guessed later.
+
+    Returns:
+        The decorated pages.
+    """
+    return sorted(
+        [
+            page_data
+            for _, page_data in DECORATED_PAGES[get_config().app_name]
+            if not omit_implicit_routes or "route" in page_data
+        ],
+        key=lambda x: x.get("route", ""),
+    )
