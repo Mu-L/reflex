@@ -1221,10 +1221,10 @@ def test_stateful_banner():
     assert isinstance(stateful_component, StatefulComponent)
 
 
-TEST_VAR = LiteralVar.create("test")._replace(
+TEST_VAR = LiteralVar.create("p")._replace(
     merge_var_data=VarData(
         hooks={"useTest": None},
-        imports={"test": [ImportVar(tag="test")]},
+        imports={"test": [ImportVar(tag="p")]},
         state="Test",
     )
 )
@@ -1233,31 +1233,31 @@ STYLE_VAR = TEST_VAR._replace(_js_expr="style")
 EVENT_CHAIN_VAR = TEST_VAR.to(EventChain)
 ARG_VAR = Var(_js_expr="arg")
 
-TEST_VAR_DICT_OF_DICT = LiteralVar.create({"a": {"b": "test"}})._replace(
+TEST_VAR_DICT_OF_DICT = LiteralVar.create({"a": {"b": "p"}})._replace(
     merge_var_data=TEST_VAR._var_data
 )
-FORMATTED_TEST_VAR_DICT_OF_DICT = LiteralVar.create(
-    {"a": {"b": "footestbar"}}
-)._replace(merge_var_data=TEST_VAR._var_data)
-
-TEST_VAR_LIST_OF_LIST = LiteralVar.create([["test"]])._replace(
-    merge_var_data=TEST_VAR._var_data
-)
-FORMATTED_TEST_VAR_LIST_OF_LIST = LiteralVar.create([["footestbar"]])._replace(
+FORMATTED_TEST_VAR_DICT_OF_DICT = LiteralVar.create({"a": {"b": "foopbar"}})._replace(
     merge_var_data=TEST_VAR._var_data
 )
 
-TEST_VAR_LIST_OF_LIST_OF_LIST = LiteralVar.create([[["test"]]])._replace(
+TEST_VAR_LIST_OF_LIST = LiteralVar.create([["p"]])._replace(
     merge_var_data=TEST_VAR._var_data
 )
-FORMATTED_TEST_VAR_LIST_OF_LIST_OF_LIST = LiteralVar.create(
-    [[["footestbar"]]]
-)._replace(merge_var_data=TEST_VAR._var_data)
+FORMATTED_TEST_VAR_LIST_OF_LIST = LiteralVar.create([["foopbar"]])._replace(
+    merge_var_data=TEST_VAR._var_data
+)
 
-TEST_VAR_LIST_OF_DICT = LiteralVar.create([{"a": "test"}])._replace(
+TEST_VAR_LIST_OF_LIST_OF_LIST = LiteralVar.create([[["p"]]])._replace(
     merge_var_data=TEST_VAR._var_data
 )
-FORMATTED_TEST_VAR_LIST_OF_DICT = LiteralVar.create([{"a": "footestbar"}])._replace(
+FORMATTED_TEST_VAR_LIST_OF_LIST_OF_LIST = LiteralVar.create([[["foopbar"]]])._replace(
+    merge_var_data=TEST_VAR._var_data
+)
+
+TEST_VAR_LIST_OF_DICT = LiteralVar.create([{"a": "p"}])._replace(
+    merge_var_data=TEST_VAR._var_data
+)
+FORMATTED_TEST_VAR_LIST_OF_DICT = LiteralVar.create([{"a": "foopbar"}])._replace(
     merge_var_data=TEST_VAR._var_data
 )
 
@@ -2335,3 +2335,15 @@ def test_special_props(component_kwargs, exp_custom_attrs, exp_style):
     for prop in SpecialComponent.get_props():
         if prop in component_kwargs:
             assert getattr(component, prop)._var_value == component_kwargs[prop]
+
+
+def test_ref():
+    """Test that the ref prop is correctly added to the component."""
+    custom_ref = Var("custom_ref")
+    ref_component = rx.box(ref=custom_ref)
+    assert ref_component._render().props["ref"].equals(custom_ref)
+
+    id_component = rx.box(id="custom_id")
+    assert id_component._render().props["ref"].equals(Var("ref_custom_id"))
+
+    assert "ref" not in rx.box()._render().props
