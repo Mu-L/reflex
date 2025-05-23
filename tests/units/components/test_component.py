@@ -911,7 +911,7 @@ def test_custom_component_wrapper():
     assert len(ccomponent.children) == 1
     assert isinstance(ccomponent.children[0], Text)
 
-    component = ccomponent.get_component(ccomponent)
+    component = ccomponent.get_component()
     assert isinstance(component, Box)
 
 
@@ -945,6 +945,22 @@ def test_invalid_event_handler_args(component2, test_state):
         component2.create(on_user_list_changed=test_state.do_something_with_int)
     with pytest.raises(EventHandlerArgTypeMismatchError):
         component2.create(on_user_list_changed=test_state.do_something_with_list_int)
+    with pytest.raises(EventHandlerArgTypeMismatchError):
+        component2.create(
+            on_user_visited_count_changed=test_state.do_something_with_bool()
+        )
+    with pytest.raises(EventHandlerArgTypeMismatchError):
+        component2.create(on_user_list_changed=test_state.do_something_with_int())
+    with pytest.raises(EventHandlerArgTypeMismatchError):
+        component2.create(on_user_list_changed=test_state.do_something_with_list_int())
+
+    component2.create(
+        on_user_visited_count_changed=test_state.do_something_with_bool(False)
+    )
+    component2.create(on_user_list_changed=test_state.do_something_with_int(23))
+    component2.create(
+        on_user_list_changed=test_state.do_something_with_list_int([2321, 321])
+    )
 
     component2.create(on_open=test_state.do_something_with_int)
     component2.create(on_open=test_state.do_something_with_bool)
@@ -1221,10 +1237,10 @@ def test_stateful_banner():
     assert isinstance(stateful_component, StatefulComponent)
 
 
-TEST_VAR = LiteralVar.create("test")._replace(
+TEST_VAR = LiteralVar.create("p")._replace(
     merge_var_data=VarData(
         hooks={"useTest": None},
-        imports={"test": [ImportVar(tag="test")]},
+        imports={"test": [ImportVar(tag="p")]},
         state="Test",
     )
 )
@@ -1233,31 +1249,31 @@ STYLE_VAR = TEST_VAR._replace(_js_expr="style")
 EVENT_CHAIN_VAR = TEST_VAR.to(EventChain)
 ARG_VAR = Var(_js_expr="arg")
 
-TEST_VAR_DICT_OF_DICT = LiteralVar.create({"a": {"b": "test"}})._replace(
+TEST_VAR_DICT_OF_DICT = LiteralVar.create({"a": {"b": "p"}})._replace(
     merge_var_data=TEST_VAR._var_data
 )
-FORMATTED_TEST_VAR_DICT_OF_DICT = LiteralVar.create(
-    {"a": {"b": "footestbar"}}
-)._replace(merge_var_data=TEST_VAR._var_data)
-
-TEST_VAR_LIST_OF_LIST = LiteralVar.create([["test"]])._replace(
-    merge_var_data=TEST_VAR._var_data
-)
-FORMATTED_TEST_VAR_LIST_OF_LIST = LiteralVar.create([["footestbar"]])._replace(
+FORMATTED_TEST_VAR_DICT_OF_DICT = LiteralVar.create({"a": {"b": "foopbar"}})._replace(
     merge_var_data=TEST_VAR._var_data
 )
 
-TEST_VAR_LIST_OF_LIST_OF_LIST = LiteralVar.create([[["test"]]])._replace(
+TEST_VAR_LIST_OF_LIST = LiteralVar.create([["p"]])._replace(
     merge_var_data=TEST_VAR._var_data
 )
-FORMATTED_TEST_VAR_LIST_OF_LIST_OF_LIST = LiteralVar.create(
-    [[["footestbar"]]]
-)._replace(merge_var_data=TEST_VAR._var_data)
+FORMATTED_TEST_VAR_LIST_OF_LIST = LiteralVar.create([["foopbar"]])._replace(
+    merge_var_data=TEST_VAR._var_data
+)
 
-TEST_VAR_LIST_OF_DICT = LiteralVar.create([{"a": "test"}])._replace(
+TEST_VAR_LIST_OF_LIST_OF_LIST = LiteralVar.create([[["p"]]])._replace(
     merge_var_data=TEST_VAR._var_data
 )
-FORMATTED_TEST_VAR_LIST_OF_DICT = LiteralVar.create([{"a": "footestbar"}])._replace(
+FORMATTED_TEST_VAR_LIST_OF_LIST_OF_LIST = LiteralVar.create([[["foopbar"]]])._replace(
+    merge_var_data=TEST_VAR._var_data
+)
+
+TEST_VAR_LIST_OF_DICT = LiteralVar.create([{"a": "p"}])._replace(
+    merge_var_data=TEST_VAR._var_data
+)
+FORMATTED_TEST_VAR_LIST_OF_DICT = LiteralVar.create([{"a": "foopbar"}])._replace(
     merge_var_data=TEST_VAR._var_data
 )
 
@@ -1823,7 +1839,7 @@ def test_custom_component_get_imports():
     assert "outer" not in custom_comp._get_all_imports()
 
     # The imports are only resolved during compilation.
-    custom_comp.get_component(custom_comp)
+    custom_comp.get_component()
     _, imports_inner = compile_custom_component(custom_comp)
     assert "inner" in imports_inner
     assert "outer" not in imports_inner
@@ -2335,3 +2351,15 @@ def test_special_props(component_kwargs, exp_custom_attrs, exp_style):
     for prop in SpecialComponent.get_props():
         if prop in component_kwargs:
             assert getattr(component, prop)._var_value == component_kwargs[prop]
+
+
+def test_ref():
+    """Test that the ref prop is correctly added to the component."""
+    custom_ref = Var("custom_ref")
+    ref_component = rx.box(ref=custom_ref)
+    assert ref_component._render().props["ref"].equals(custom_ref)
+
+    id_component = rx.box(id="custom_id")
+    assert id_component._render().props["ref"].equals(Var("ref_custom_id"))
+
+    assert "ref" not in rx.box()._render().props
